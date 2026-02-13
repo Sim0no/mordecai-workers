@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { Worker } from 'bullmq';
 import { loadDatabase } from 'mordcai-api/src/loaders/sequelize.load.js';
 import { sequelize } from 'mordcai-api/src/config/database.js';
@@ -13,29 +14,56 @@ import {
 
 const concurrency = Number(process.env.WORKER_CONCURRENCY) || 5;
 const cooldownMinutes = Number(process.env.WORKER_COOLDOWN_MINUTES) || 360;
+const contextSignatureVersion = process.env.CALL_CONTEXT_SIGNATURE_VERSION || '1';
+const contextTtlSeconds = Number(process.env.CALL_CONTEXT_TTL_SECONDS) || 600;
 
 const getTwilioConfig = () => {
   const accountSid = process.env.TWILIO_ACCOUNT_SID;
   const authToken = process.env.TWILIO_AUTH_TOKEN;
   const fromNumber = process.env.TWILIO_FROM_NUMBER;
   const voiceUrl = process.env.TWILIO_VOICE_URL;
+  const contextHmacSecret = process.env.CALL_CONTEXT_HMAC_SECRET;
 
-  if (!accountSid || !authToken || !fromNumber || !voiceUrl) {
+  if (!accountSid || !authToken || !fromNumber || !voiceUrl || !contextHmacSecret) {
     throw new Error(
-      'Missing TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER, or TWILIO_VOICE_URL'
+      'Missing TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER, TWILIO_VOICE_URL, or CALL_CONTEXT_HMAC_SECRET'
     );
   }
 
-  return { accountSid, authToken, fromNumber, voiceUrl };
+  return { accountSid, authToken, fromNumber, voiceUrl, contextHmacSecret };
 };
 
-const createTwilioCall = async ({ to }) => {
-  const { accountSid, authToken, fromNumber, voiceUrl } = getTwilioConfig();
+const buildSignedVoiceUrl = ({ voiceUrl, interactionId, tenantId, caseId, contextHmacSecret }) => {
+  const exp = Math.floor(Date.now() / 1000) + contextTtlSeconds;
+  const payload = `${interactionId}|${tenantId}|${caseId}|${exp}|${contextSignatureVersion}`;
+  const sig = crypto
+    .createHmac('sha256', contextHmacSecret)
+    .update(payload, 'utf8')
+    .digest('base64url');
+
+  const url = new URL(voiceUrl);
+  url.searchParams.set('il', interactionId);
+  url.searchParams.set('exp', String(exp));
+  url.searchParams.set('v', contextSignatureVersion);
+  url.searchParams.set('sig', sig);
+  return url.toString();
+};
+
+const createTwilioCall = async ({ to, interactionId, tenantId, caseId }) => {
+  const { accountSid, authToken, fromNumber, voiceUrl, contextHmacSecret } =
+    getTwilioConfig();
+  const signedVoiceUrl = buildSignedVoiceUrl({
+    voiceUrl,
+    interactionId,
+    tenantId,
+    caseId,
+    contextHmacSecret,
+  });
 
   const params = new URLSearchParams({
     To: to,
     From: fromNumber,
-    Url: voiceUrl,
+    Url: signedVoiceUrl,
   });
 
   const response = await fetch(
@@ -76,17 +104,40 @@ const processCallCase = async ({ tenantId, caseId }) => {
 
   const debtorPhone = debtCase.debtor?.phone;
   if (!debtorPhone) {
-    throw new Error('Debtor phone is missing');
+    await debtCase.update({
+      status: 'INVALID_CONTACT',
+      nextActionAt: null,
+      meta: {
+        ...(debtCase.meta || {}),
+        invalid_contact_reason: 'missing_phone',
+      },
+    });
+
+    const log = await InteractionLog.create({
+      tenantId,
+      debtCaseId: debtCase.id,
+      debtorId: debtCase.debtorId,
+      type: 'CALL',
+      status: 'failed',
+      channelProvider: 'twilio',
+      outcome: 'FAILED',
+      summary: 'Call not attempted: debtor phone is missing.',
+      error: {
+        message: 'Debtor phone is missing',
+      },
+    });
+
+    return { caseId: debtCase.id, logId: log.id, skipped: true };
   }
 
   const now = new Date();
   const nextActionAt = new Date(now.getTime() + cooldownMinutes * 60 * 1000);
+  let log = null;
 
-  const callSid = await createTwilioCall({ to: debtorPhone });
-
+  // 1) Persist interaction first so it can be used as signed context in Twilio voice URL.
   const transaction = await sequelize.transaction();
   try {
-    const log = await InteractionLog.create(
+    log = await InteractionLog.create(
       {
         tenantId,
         debtCaseId: debtCase.id,
@@ -94,7 +145,7 @@ const processCallCase = async ({ tenantId, caseId }) => {
         type: 'CALL',
         status: 'queued',
         channelProvider: 'twilio',
-        providerRef: callSid,
+        providerRef: null,
         startedAt: now,
       },
       { transaction }
@@ -110,11 +161,53 @@ const processCallCase = async ({ tenantId, caseId }) => {
     );
 
     await transaction.commit();
-
-    return { caseId: debtCase.id, logId: log.id, callSid };
   } catch (error) {
     await transaction.rollback();
     throw error;
+  }
+
+  // 2) Call Twilio using signed interaction context.
+  try {
+    const callSid = await createTwilioCall({
+      to: debtorPhone,
+      interactionId: log.id,
+      tenantId,
+      caseId: debtCase.id,
+    });
+
+    await log.update({
+      providerRef: callSid,
+      status: 'in_progress',
+    });
+
+    return { caseId: debtCase.id, logId: log.id, callSid };
+  } catch (error) {
+    logger.error(
+      { err: error, tenantId, caseId: debtCase.id, interactionId: log.id },
+      'Twilio call failed after interaction creation'
+    );
+
+    await log.update({
+      status: 'failed',
+      outcome: 'FAILED',
+      endedAt: new Date(),
+      error: {
+        ...(log.error || {}),
+        message: error?.message || 'Twilio call failed',
+      },
+    });
+
+    await debtCase.update({
+      status: 'IN_PROGRESS',
+      nextActionAt: new Date(Date.now() + cooldownMinutes * 60 * 1000),
+      meta: {
+        ...(debtCase.meta || {}),
+        last_call_error_at: new Date().toISOString(),
+        last_call_error_message: error?.message || 'Twilio call failed',
+      },
+    });
+
+    return { caseId: debtCase.id, logId: log.id, callSid: null, failed: true };
   }
 };
 

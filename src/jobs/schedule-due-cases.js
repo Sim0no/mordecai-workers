@@ -160,9 +160,14 @@ export const scheduleDueCallCases = async ({
   let queued = 0;
   for (const row of result) {
     try {
+      const payload = {
+        tenantId: row.tenant_id,
+        caseId: row.id,
+      };
+
       await caseActionsQueue.add(
         JOB_TYPES.CALL_CASE,
-        { tenantId: row.tenant_id, caseId: row.id },
+        payload,
         {
           jobId: `${JOB_TYPES.CALL_CASE}-${row.id}`,
           attempts: Number(process.env.WORKER_ATTEMPTS) || 3,
