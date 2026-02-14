@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { Worker } from 'bullmq';
+import { Op } from 'sequelize';
 import { loadDatabase } from 'mordcai-api/src/loaders/sequelize.load.js';
 import { sequelize } from 'mordcai-api/src/config/database.js';
 import { logger } from 'mordcai-api/src/utils/logger.js';
@@ -128,6 +129,34 @@ const processCallCase = async ({ tenantId, caseId }) => {
     });
 
     return { caseId: debtCase.id, logId: log.id, skipped: true };
+  }
+
+  const activeCall = await InteractionLog.findOne({
+    where: {
+      tenantId,
+      debtCaseId: debtCase.id,
+      type: 'CALL',
+      status: { [Op.in]: ['queued', 'in_progress'] },
+      endedAt: null,
+    },
+    order: [['createdAt', 'DESC']],
+  });
+
+  if (activeCall) {
+    logger.warn(
+      {
+        tenantId,
+        caseId: debtCase.id,
+        interactionId: activeCall.id,
+      },
+      'Skipping CALL_CASE because there is already an active call interaction'
+    );
+    return {
+      caseId: debtCase.id,
+      logId: activeCall.id,
+      skipped: true,
+      reason: 'active_call_exists',
+    };
   }
 
   const now = new Date();

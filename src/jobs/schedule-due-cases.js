@@ -5,6 +5,9 @@ import { caseActionsQueue, JOB_TYPES } from '../queues/case-actions.queue.js';
 const DEFAULT_LIMIT = 500;
 const DEFAULT_PER_TENANT_LIMIT = 10;
 const DEFAULT_COOLDOWN_MINUTES = 360;
+const includeDemoCases =
+  String(process.env.SCHEDULER_INCLUDE_DEMO_CASES || 'false').toLowerCase() ===
+  'true';
 
 const resolvePerTenantLimit = (tenantId, limit, perTenantLimit) =>
   tenantId ? limit : perTenantLimit;
@@ -16,6 +19,11 @@ const buildTenantClause = (tenantId, replacements) => {
 
   replacements.tenantId = tenantId;
   return 'AND dc.tenant_id = :tenantId';
+};
+
+const buildDemoSourceClause = () => {
+  if (includeDemoCases) return '';
+  return "AND COALESCE(dc.meta->>'source', '') <> 'demo-ui'";
 };
 
 export const listDueCallCases = async ({
@@ -34,6 +42,7 @@ export const listDueCallCases = async ({
   );
   const replacements = { limit, perTenantLimit: effectivePerTenantLimit };
   const tenantClause = buildTenantClause(tenantId, replacements);
+  const demoClause = buildDemoSourceClause();
 
   const sql = `
     WITH due AS (
@@ -51,6 +60,7 @@ export const listDueCallCases = async ({
       WHERE dc.status IN ('NEW','IN_PROGRESS')
         AND (dc.next_action_at IS NULL OR dc.next_action_at <= NOW())
         ${tenantClause}
+        ${demoClause}
         AND COALESCE((fp.channels->>'call')::boolean, false) = true
     )
     SELECT id, tenant_id
@@ -86,6 +96,7 @@ const claimDueCallCases = async ({
     cooldownMinutes,
   };
   const tenantClause = buildTenantClause(tenantId, replacements);
+  const demoClause = buildDemoSourceClause();
 
   const sql = `
     WITH due AS (
@@ -103,6 +114,7 @@ const claimDueCallCases = async ({
       WHERE dc.status IN ('NEW','IN_PROGRESS')
         AND (dc.next_action_at IS NULL OR dc.next_action_at <= NOW())
         ${tenantClause}
+        ${demoClause}
         AND COALESCE((fp.channels->>'call')::boolean, false) = true
     ),
     picked AS (
