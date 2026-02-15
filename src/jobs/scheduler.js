@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { loadDatabase } from 'mordcai-api/src/loaders/sequelize.load.js';
 import { sequelize } from 'mordcai-api/src/config/database.js';
 import { logger } from 'mordcai-api/src/utils/logger.js';
