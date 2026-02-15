@@ -300,19 +300,88 @@ const start = async () => {
     }
   });
 
-  const shutdown = async () => {
-    logger.info('Worker shutting down');
-    await worker.close();
-    await pmsSyncWorker.close();
-    await redisConnection.quit();
+  const SHUTDOWN_TIMEOUT_MS = Number(process.env.WORKER_SHUTDOWN_TIMEOUT_MS) || 90_000; // 90s default (PMS sync can be long)
+
+  const doForceClose = async () => {
+    try {
+      await worker.close();
+    } catch (e) {
+      logger.warn({ err: e?.message }, 'Error closing case-actions worker');
+    }
+    try {
+      await pmsSyncWorker.close();
+    } catch (e) {
+      logger.warn({ err: e?.message }, 'Error closing PMS sync worker');
+    }
+    try {
+      await redisConnection.quit();
+    } catch (e) {
+      logger.warn({ err: e?.message }, 'Error closing Redis');
+    }
     if (sequelize) {
-      await sequelize.close();
+      try {
+        await sequelize.close();
+      } catch (e) {
+        logger.warn({ err: e?.message }, 'Error closing Sequelize');
+      }
     }
     process.exit(0);
   };
 
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
+  let shutdownTimeoutId = null;
+
+  const shutdown = async (force = false) => {
+    if (shutdown.inProgress && !force) {
+      logger.warn('Shutdown already in progress. Press Ctrl+C again to force exit.');
+      return;
+    }
+    if (force && shutdown.inProgress) {
+      logger.warn('Forcing exit…');
+      if (shutdownTimeoutId) clearTimeout(shutdownTimeoutId);
+      await doForceClose();
+      return;
+    }
+    shutdown.inProgress = true;
+    logger.info('Shutdown requested. Waiting for current job(s) to finish (Ctrl+C again to force exit)…');
+
+    shutdownTimeoutId = setTimeout(() => {
+      shutdownTimeoutId = null;
+      logger.warn('Shutdown timeout reached, closing workers and exiting');
+      doForceClose();
+    }, SHUTDOWN_TIMEOUT_MS);
+
+    try {
+      await worker.close();
+      await pmsSyncWorker.close();
+      if (shutdownTimeoutId) {
+        clearTimeout(shutdownTimeoutId);
+        shutdownTimeoutId = null;
+      }
+      await redisConnection.quit();
+      if (sequelize) {
+        await sequelize.close();
+      }
+      logger.info('Worker shut down cleanly');
+      process.exit(0);
+    } catch (err) {
+      if (shutdownTimeoutId) {
+        clearTimeout(shutdownTimeoutId);
+        shutdownTimeoutId = null;
+      }
+      logger.warn({ err: err?.message }, 'Error during graceful shutdown');
+      await doForceClose();
+    }
+  };
+  shutdown.inProgress = false;
+
+  process.on('SIGTERM', () => shutdown(false));
+  process.on('SIGINT', () => {
+    if (shutdown.inProgress) {
+      shutdown(true);
+    } else {
+      shutdown(false);
+    }
+  });
 };
 
 start().catch((error) => {
