@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import crypto from 'crypto';
 import { Worker } from 'bullmq';
 import { Op } from 'sequelize';
@@ -6,11 +7,14 @@ import { sequelize } from 'mordcai-api/src/config/database.js';
 import { logger } from 'mordcai-api/src/utils/logger.js';
 import { redisConnection } from '../queues/redis.js';
 import { CASE_ACTIONS_QUEUE, JOB_TYPES } from '../queues/case-actions.queue.js';
+import { PMS_SYNC_QUEUE_NAME } from 'mordcai-api/src/queues/pms-sync.queue.js';
+import { runSync } from 'mordcai-api/src/modules/property-managers/sync/sync-runner.service.js';
 import {
   DebtCase,
   Debtor,
   FlowPolicy,
   InteractionLog,
+  PmsConnection,
 } from 'mordcai-api/src/models/index.js';
 
 const concurrency = Number(process.env.WORKER_CONCURRENCY) || 5;
@@ -248,6 +252,14 @@ const start = async () => {
     return;
   }
 
+  // Reduce Redis usage for Upstash (limit 500k req): stalled check every 2 min, shared connection
+  const workerOpts = {
+    connection: redisConnection,
+    concurrency,
+    stalledInterval: 120000, // 2 min (default 30s) — fewer stall checks = fewer Redis calls
+    sharedConnection: true,
+  };
+
   const worker = new Worker(
     CASE_ACTIONS_QUEUE,
     async (job) => {
@@ -257,10 +269,24 @@ const start = async () => {
       logger.warn({ jobName: job.name }, 'Unknown job type received');
       return null;
     },
-    {
-      connection: redisConnection,
-      concurrency,
-    }
+    { ...workerOpts }
+  );
+
+  const pmsSyncWorker = new Worker(
+    PMS_SYNC_QUEUE_NAME,
+    async (job) => {
+      if (job.name === 'sync') {
+        const { connectionId, trigger, idempotencyKey, steps } = job.data;
+        logger.info(
+          { jobId: job.id, connectionId, trigger, steps, attempt: job.attemptsMade + 1 },
+          'PMS sync job started'
+        );
+        return runSync(connectionId, { trigger, idempotencyKey, steps });
+      }
+      logger.warn({ jobName: job.name }, 'Unknown PMS sync job type');
+      return null;
+    },
+    { ...workerOpts, concurrency: 1 }
   );
 
   worker.on('completed', (job) => {
@@ -271,18 +297,120 @@ const start = async () => {
     logger.error({ jobId: job?.id, error }, 'Job failed');
   });
 
-  const shutdown = async () => {
-    logger.info('Worker shutting down');
-    await worker.close();
-    await redisConnection.quit();
+  pmsSyncWorker.on('completed', (job) => {
+    logger.info({ jobId: job.id, name: job.name }, 'PMS sync job completed');
+  });
+
+  pmsSyncWorker.on('failed', async (job, error) => {
+    const connectionId = job?.data?.connectionId;
+    logger.error(
+      {
+        jobId: job?.id,
+        connectionId,
+        message: error?.message,
+        stack: error?.stack,
+        name: error?.name,
+      },
+      'PMS sync job failed'
+    );
+    if (connectionId) {
+      try {
+        await PmsConnection.update(
+          {
+            status: 'error',
+            lastError: { message: error?.message || 'Sync job failed' },
+          },
+          { where: { id: connectionId } }
+        );
+        logger.info({ connectionId }, 'PMS connection status reset to error after job failure');
+      } catch (updateErr) {
+        logger.warn({ connectionId, err: updateErr?.message }, 'Could not reset connection status to error');
+      }
+    }
+  });
+
+  const SHUTDOWN_TIMEOUT_MS = Number(process.env.WORKER_SHUTDOWN_TIMEOUT_MS) || 90_000; // 90s default (PMS sync can be long)
+
+  const doForceClose = async () => {
+    try {
+      await worker.close();
+    } catch (e) {
+      logger.warn({ err: e?.message }, 'Error closing case-actions worker');
+    }
+    try {
+      await pmsSyncWorker.close();
+    } catch (e) {
+      logger.warn({ err: e?.message }, 'Error closing PMS sync worker');
+    }
+    try {
+      await redisConnection.quit();
+    } catch (e) {
+      logger.warn({ err: e?.message }, 'Error closing Redis');
+    }
     if (sequelize) {
-      await sequelize.close();
+      try {
+        await sequelize.close();
+      } catch (e) {
+        logger.warn({ err: e?.message }, 'Error closing Sequelize');
+      }
     }
     process.exit(0);
   };
 
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
+  let shutdownTimeoutId = null;
+
+  const shutdown = async (force = false) => {
+    if (shutdown.inProgress && !force) {
+      logger.warn('Shutdown already in progress. Press Ctrl+C again to force exit.');
+      return;
+    }
+    if (force && shutdown.inProgress) {
+      logger.warn('Forcing exit…');
+      if (shutdownTimeoutId) clearTimeout(shutdownTimeoutId);
+      await doForceClose();
+      return;
+    }
+    shutdown.inProgress = true;
+    logger.info('Shutdown requested. Waiting for current job(s) to finish (Ctrl+C again to force exit)…');
+
+    shutdownTimeoutId = setTimeout(() => {
+      shutdownTimeoutId = null;
+      logger.warn('Shutdown timeout reached, closing workers and exiting');
+      doForceClose();
+    }, SHUTDOWN_TIMEOUT_MS);
+
+    try {
+      await worker.close();
+      await pmsSyncWorker.close();
+      if (shutdownTimeoutId) {
+        clearTimeout(shutdownTimeoutId);
+        shutdownTimeoutId = null;
+      }
+      await redisConnection.quit();
+      if (sequelize) {
+        await sequelize.close();
+      }
+      logger.info('Worker shut down cleanly');
+      process.exit(0);
+    } catch (err) {
+      if (shutdownTimeoutId) {
+        clearTimeout(shutdownTimeoutId);
+        shutdownTimeoutId = null;
+      }
+      logger.warn({ err: err?.message }, 'Error during graceful shutdown');
+      await doForceClose();
+    }
+  };
+  shutdown.inProgress = false;
+
+  process.on('SIGTERM', () => shutdown(false));
+  process.on('SIGINT', () => {
+    if (shutdown.inProgress) {
+      shutdown(true);
+    } else {
+      shutdown(false);
+    }
+  });
 };
 
 start().catch((error) => {
