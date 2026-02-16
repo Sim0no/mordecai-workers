@@ -5,4 +5,4 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --omit=dev
 COPY . .
-CMD ["node", "src/jobs/worker.js"]
+CMD ["npm", "run", "worker"]
