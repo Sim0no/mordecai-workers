@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import crypto from 'crypto';
-import { Worker } from 'bullmq';
+import { Worker, Queue } from 'bullmq';
 import { Op } from 'sequelize';
 import { loadDatabase } from 'mordcai-api/src/loaders/sequelize.load.js';
 import { sequelize } from 'mordcai-api/src/config/database.js';
@@ -8,14 +8,17 @@ import { logger } from 'mordcai-api/src/utils/logger.js';
 import { redisConnection } from '../queues/redis.js';
 import { CASE_ACTIONS_QUEUE, JOB_TYPES } from '../queues/case-actions.queue.js';
 import { PMS_SYNC_QUEUE_NAME } from 'mordcai-api/src/queues/pms-sync.queue.js';
+import { COLLECTION_TICK_QUEUE_NAME } from 'mordcai-api/src/queues/collection-tick.queue.js';
 import { runSync } from 'mordcai-api/src/modules/property-managers/sync/sync-runner.service.js';
+import { propertyManagersService } from 'mordcai-api/src/modules/property-managers/property-managers.service.js';
+import { runCollectionTick } from 'mordcai-api/src/modules/collections/collection-tick.service.js';
 import {
   DebtCase,
   Debtor,
-  FlowPolicy,
   InteractionLog,
   PmsConnection,
 } from 'mordcai-api/src/models/index.js';
+import { resolvePolicyForCase } from 'mordcai-api/src/modules/collections/policy-resolver.service.js';
 
 const concurrency = Number(process.env.WORKER_CONCURRENCY) || 5;
 const cooldownMinutes = Number(process.env.WORKER_COOLDOWN_MINUTES) || 360;
@@ -97,15 +100,15 @@ const createTwilioCall = async ({ to, interactionId, tenantId, caseId }) => {
 const processCallCase = async ({ tenantId, caseId }) => {
   const debtCase = await DebtCase.findOne({
     where: { id: caseId, tenantId },
-    include: [
-      { model: Debtor, as: 'debtor' },
-      { model: FlowPolicy, as: 'flowPolicy' },
-    ],
+    include: [{ model: Debtor, as: 'debtor' }],
   });
 
   if (!debtCase) {
     throw new Error('Debt case not found');
   }
+
+  const resolvedPolicy = await resolvePolicyForCase(tenantId, debtCase);
+  debtCase.resolvedPolicy = resolvedPolicy;
 
   const debtorPhone = debtCase.debtor?.phone;
   if (!debtorPhone) {
@@ -252,12 +255,14 @@ const start = async () => {
     return;
   }
 
-  // Reduce Redis usage for Upstash (limit 500k req): stalled check every 2 min, shared connection
+  // Reduce Redis usage for Upstash (limit 500k req)
   const workerOpts = {
     connection: redisConnection,
     concurrency,
     stalledInterval: 120000, // 2 min (default 30s) — fewer stall checks = fewer Redis calls
     sharedConnection: true,
+    blockingTimeout: 60000, // 60s — in idle, pop every min vs ~5s default → ~10–12x fewer BZPOPMIN/EVALSHA
+    drainDelay: 5000,       // graceful drain on shutdown
   };
 
   const worker = new Worker(
@@ -283,11 +288,35 @@ const start = async () => {
         );
         return runSync(connectionId, { trigger, idempotencyKey, steps });
       }
+      if (job.name === 'build-cases') {
+        const { connectionId, tenantId } = job.data;
+        logger.info({ jobId: job.id, connectionId, tenantId }, 'Build cases job started');
+        const result = await propertyManagersService.buildDebtCasesFromPms(tenantId, connectionId);
+        logger.info({ jobId: job.id, ...result }, 'Build cases job completed');
+        return result;
+      }
       logger.warn({ jobName: job.name }, 'Unknown PMS sync job type');
       return null;
     },
     { ...workerOpts, concurrency: 1 }
   );
+
+  const collectionTickWorker = new Worker(
+    COLLECTION_TICK_QUEUE_NAME,
+    async (job) => {
+      if (job.name === 'tick') {
+        logger.debug({ jobId: job.id }, 'Collection tick job started');
+        return runCollectionTick();
+      }
+      logger.warn({ jobName: job.name }, 'Unknown collection tick job type');
+      return null;
+    },
+    { ...workerOpts, concurrency: 1 }
+  );
+
+  const collectionTickQueue = new Queue(COLLECTION_TICK_QUEUE_NAME, { connection: redisConnection });
+  await collectionTickQueue.add('tick', {}, { repeat: { every: 15 * 60 * 1000 } });
+  logger.info('Collection tick repeatable job scheduled (every 15 min)');
 
   worker.on('completed', (job) => {
     logger.info({ jobId: job.id, name: job.name }, 'Job completed');
@@ -331,6 +360,13 @@ const start = async () => {
 
   const SHUTDOWN_TIMEOUT_MS = Number(process.env.WORKER_SHUTDOWN_TIMEOUT_MS) || 90_000; // 90s default (PMS sync can be long)
 
+  collectionTickWorker.on('completed', (job) => {
+    logger.debug({ jobId: job.id }, 'Collection tick job completed');
+  });
+  collectionTickWorker.on('failed', (job, error) => {
+    logger.error({ jobId: job?.id, error }, 'Collection tick job failed');
+  });
+
   const doForceClose = async () => {
     try {
       await worker.close();
@@ -341,6 +377,11 @@ const start = async () => {
       await pmsSyncWorker.close();
     } catch (e) {
       logger.warn({ err: e?.message }, 'Error closing PMS sync worker');
+    }
+    try {
+      await collectionTickWorker.close();
+    } catch (e) {
+      logger.warn({ err: e?.message }, 'Error closing collection tick worker');
     }
     try {
       await redisConnection.quit();
@@ -382,6 +423,7 @@ const start = async () => {
     try {
       await worker.close();
       await pmsSyncWorker.close();
+      await collectionTickWorker.close();
       if (shutdownTimeoutId) {
         clearTimeout(shutdownTimeoutId);
         shutdownTimeoutId = null;
