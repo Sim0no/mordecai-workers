@@ -17,8 +17,13 @@ import {
   Debtor,
   InteractionLog,
   PmsConnection,
+  Tenant,
+  CollectionStage,
+  CaseAutomationState,
 } from 'mordcai-api/src/models/index.js';
 import { resolvePolicyForCase } from 'mordcai-api/src/modules/collections/policy-resolver.service.js';
+import { sendCollectionSms } from 'mordcai-api/src/modules/twilio/sms/twilio.sms.service.js';
+import { sendCollectionEmail } from 'mordcai-api/src/modules/email/ses/ses.email.service.js';
 
 const concurrency = Number(process.env.WORKER_CONCURRENCY) || 5;
 const cooldownMinutes = Number(process.env.WORKER_COOLDOWN_MINUTES) || 360;
@@ -247,6 +252,59 @@ const processCallCase = async ({ tenantId, caseId }) => {
   }
 };
 
+const processSmsCase = async ({ tenantId, caseId, automationId, stateId }) => {
+  const debtCase = await DebtCase.findOne({
+    where: { id: caseId, tenantId },
+    include: [{ model: Debtor, as: 'debtor' }],
+  });
+  if (!debtCase) throw new Error('Debt case not found');
+
+  let stage = null;
+  if (stateId) {
+    const state = await CaseAutomationState.findByPk(stateId, {
+      include: [{ model: CollectionStage, as: 'currentStage' }],
+    });
+    stage = state?.currentStage || null;
+  }
+
+  const tenant = await Tenant.findByPk(tenantId, { attributes: ['id', 'name'] });
+
+  return sendCollectionSms({
+    tenantId,
+    automationId,
+    state: { debtCaseId: caseId, debtorId: debtCase.debtorId },
+    debtCase,
+    debtor: debtCase.debtor,
+    stage,
+    tenant,
+  });
+};
+
+const processEmailCase = async ({ tenantId, caseId, automationId, stateId }) => {
+  const debtCase = await DebtCase.findOne({
+    where: { id: caseId, tenantId },
+    include: [{ model: Debtor, as: 'debtor' }],
+  });
+  if (!debtCase) throw new Error('Debt case not found');
+
+  let stage = null;
+  if (stateId) {
+    const state = await CaseAutomationState.findByPk(stateId, {
+      include: [{ model: CollectionStage, as: 'currentStage' }],
+    });
+    stage = state?.currentStage || null;
+  }
+
+  return sendCollectionEmail({
+    tenantId,
+    automationId,
+    state: { debtCaseId: caseId, debtorId: debtCase.debtorId },
+    debtCase,
+    debtor: debtCase.debtor,
+    stage,
+  });
+};
+
 const start = async () => {
   await loadDatabase();
 
@@ -270,6 +328,12 @@ const start = async () => {
     async (job) => {
       if (job.name === JOB_TYPES.CALL_CASE) {
         return processCallCase(job.data);
+      }
+      if (job.name === JOB_TYPES.SMS_CASE) {
+        return processSmsCase(job.data);
+      }
+      if (job.name === JOB_TYPES.EMAIL_CASE) {
+        return processEmailCase(job.data);
       }
       logger.warn({ jobName: job.name }, 'Unknown job type received');
       return null;
