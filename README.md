@@ -1,6 +1,6 @@
 # mordecai-workers
 
-Workers + scheduler for Mordecai. Este repo tiene los **consumidores de colas** (BullMQ) y el scheduler. La API (mordecai-api) encola jobs; el worker los procesa. Modelos, config y logger se importan del repo de la API (una sola fuente de verdad).
+Workers for Mordecai. Este repo tiene los **consumidores de colas** (BullMQ). La API (mordecai-api) encola jobs; el worker los procesa. Modelos, config y logger se importan del repo de la API (una sola fuente de verdad).
 
 ## Cómo funciona
 
@@ -96,15 +96,14 @@ El sync llama a `connector.syncFull()`; si no hay credenciales o el connector no
 ### Cola `case-actions`
 
 1. **`CALL_CASE`**  
-   Encodado por el scheduler cuando un debt case está due. El worker inicia una llamada Twilio al teléfono del debtor usando `TWILIO_VOICE_URL` y guarda el `callSid` en `interaction_logs.provider_ref`.
+   Encolado por la API/Collections Engine v2 (tick/acciones manuales). El worker inicia una llamada Twilio al teléfono del debtor usando `TWILIO_VOICE_URL` y guarda el `callSid` en `interaction_logs.provider_ref`.
 
 2. **`SYNC_CALL_SUMMARY`** (reservado)  
    Futuro: leer resumen de llamada desde S3 y actualizar BD.
 
 ## Roles
 
-- **Scheduler** (`npm run scheduler`): selecciona casos due y encola `CALL_CASE`.
-- **Worker** (`npm run worker`): consume jobs de `pms-sync` y `case-actions` y ejecuta sync / llamadas Twilio / actualizaciones en BD.
+- **Worker** (`npm run worker`): consume jobs de `pms-sync`, `collection-tick`, `automation-maintenance` y `case-actions` y ejecuta sync / llamadas Twilio / SMS / email / actualizaciones en BD.
 
 ## Despliegue: Worker en EC2, API en App Runner
 
@@ -196,13 +195,6 @@ En EC2 el worker se despliega y se deja corriendo con pm2 (tu modelo actual).
 pm2 start src/jobs/worker.js --name mordecai-worker
 pm2 save
 pm2 startup
-```
-
-Para el scheduler (si lo usas):
-
-```bash
-pm2 start src/jobs/scheduler.js --name mordecai-scheduler
-pm2 save
 ```
 
 `pm2 logs mordecai-worker` para ver logs.

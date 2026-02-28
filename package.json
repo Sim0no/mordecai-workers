@@ -4,8 +4,7 @@
   "description": "Workers and scheduler for Mordecai",
   "type": "module",
   "scripts": {
-    "worker": "node src/jobs/worker.js",
-    "scheduler": "node src/jobs/scheduler.js"
+    "worker": "node src/jobs/worker.js"
   },
   "dependencies": {
     "bullmq": "^5.66.6",
