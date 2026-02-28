@@ -9,8 +9,14 @@ import { redisConnection } from '../queues/redis.js';
 import { CASE_ACTIONS_QUEUE, JOB_TYPES } from '../queues/case-actions.queue.js';
 import { PMS_SYNC_QUEUE_NAME } from 'mordcai-api/src/queues/pms-sync.queue.js';
 import { COLLECTION_TICK_QUEUE_NAME } from 'mordcai-api/src/queues/collection-tick.queue.js';
+import { AUTOMATION_MAINTENANCE_QUEUE_NAME } from 'mordcai-api/src/queues/automation-maintenance.queue.js';
+import { runHourlyMaintenance } from 'mordcai-api/src/modules/automations/automation-hourly-maintenance.service.js';
+import { runDailyFullSync } from 'mordcai-api/src/modules/automations/automation-daily-fullsync.service.js';
 import { runSync } from 'mordcai-api/src/modules/property-managers/sync/sync-runner.service.js';
 import { propertyManagersService } from 'mordcai-api/src/modules/property-managers/property-managers.service.js';
+import { buildNewCasesFromPms } from 'mordcai-api/src/modules/property-managers/case-build.service.js';
+import { refreshCasesFromPms } from 'mordcai-api/src/modules/property-managers/case-refresh.service.js';
+import { releaseLock } from 'mordcai-api/src/utils/pms-sync-lock.js';
 import { runCollectionTick } from 'mordcai-api/src/modules/collections/collection-tick.service.js';
 import {
   DebtCase,
@@ -20,6 +26,7 @@ import {
   Tenant,
   CollectionStage,
   CaseAutomationState,
+  CaseDispute,
 } from 'mordcai-api/src/models/index.js';
 import { resolvePolicyForCase } from 'mordcai-api/src/modules/collections/policy-resolver.service.js';
 import { sendCollectionSms } from 'mordcai-api/src/modules/twilio/sms/twilio.sms.service.js';
@@ -110,6 +117,17 @@ const processCallCase = async ({ tenantId, caseId }) => {
 
   if (!debtCase) {
     throw new Error('Debt case not found');
+  }
+
+  if ((debtCase.approvalStatus ?? debtCase.approval_status) !== 'APPROVED') {
+    return { caseId: debtCase.id, skipped: true, reason: 'approval_required' };
+  }
+
+  const hasOpenDispute = await CaseDispute.count({
+    where: { debtCaseId: caseId, status: 'OPEN' },
+  }) > 0;
+  if (hasOpenDispute) {
+    return { caseId: debtCase.id, skipped: true, reason: 'open_dispute' };
   }
 
   const resolvedPolicy = await resolvePolicyForCase(tenantId, debtCase);
@@ -287,6 +305,12 @@ const processEmailCase = async ({ tenantId, caseId, automationId, stateId }) => 
   });
   if (!debtCase) throw new Error('Debt case not found');
 
+  if ((debtCase.approvalStatus ?? debtCase.approval_status) !== 'APPROVED') {
+    return { caseId: debtCase.id, skipped: true, reason: 'approval_required' };
+  }
+  const hasOpenDispute = await CaseDispute.count({ where: { debtCaseId: caseId, status: 'OPEN' } }) > 0;
+  if (hasOpenDispute) return { caseId: debtCase.id, skipped: true, reason: 'open_dispute' };
+
   let stage = null;
   if (stateId) {
     const state = await CaseAutomationState.findByPk(stateId, {
@@ -352,12 +376,26 @@ const start = async () => {
         );
         return runSync(connectionId, { trigger, idempotencyKey, steps });
       }
-      if (job.name === 'build-cases') {
+      if (job.name === 'build-cases' || job.name === 'build-new-cases') {
         const { connectionId, tenantId } = job.data;
-        logger.info({ jobId: job.id, connectionId, tenantId }, 'Build cases job started');
-        const result = await propertyManagersService.buildDebtCasesFromPms(tenantId, connectionId);
-        logger.info({ jobId: job.id, ...result }, 'Build cases job completed');
+        logger.info({ jobId: job.id, connectionId, tenantId }, 'Build new cases job started');
+        const result = await buildNewCasesFromPms(tenantId, connectionId);
+        logger.info({ jobId: job.id, ...result }, 'Build new cases job completed');
         return result;
+      }
+      if (job.name === 'refresh-cases') {
+        const { connectionId, tenantId } = job.data;
+        logger.info({ jobId: job.id, connectionId, tenantId }, 'Refresh cases job started');
+        const result = await refreshCasesFromPms(tenantId, connectionId);
+        logger.info({ jobId: job.id, ...result }, 'Refresh cases job completed');
+        return result;
+      }
+      if (job.name === 'sync-full-flow') {
+        const { connectionId, tenantId } = job.data;
+        logger.info({ jobId: job.id, connectionId, tenantId }, 'Sync full flow job started');
+        const results = await propertyManagersService.runSyncFullFlow(tenantId, connectionId);
+        logger.info({ jobId: job.id, ...results }, 'Sync full flow job completed');
+        return results;
       }
       logger.warn({ jobName: job.name }, 'Unknown PMS sync job type');
       return null;
@@ -382,6 +420,44 @@ const start = async () => {
   await collectionTickQueue.add('tick', {}, { repeat: { every: 15 * 60 * 1000 } });
   logger.info('Collection tick repeatable job scheduled (every 15 min)');
 
+  const automationMaintenanceWorker = new Worker(
+    AUTOMATION_MAINTENANCE_QUEUE_NAME,
+    async (job) => {
+      if (job.name === 'hourly') {
+        logger.info({ jobId: job.id }, 'Automation hourly maintenance job started');
+        return runHourlyMaintenance();
+      }
+      if (job.name === 'daily-fullsync') {
+        logger.info({ jobId: job.id }, 'Automation daily full sync job started');
+        return runDailyFullSync();
+      }
+      logger.warn({ jobName: job.name }, 'Unknown automation maintenance job type');
+      return null;
+    },
+    { ...workerOpts, concurrency: 1 }
+  );
+
+  const automationMaintenanceQueue = new Queue(AUTOMATION_MAINTENANCE_QUEUE_NAME, {
+    connection: redisConnection,
+  });
+  if (process.env.REDIS_URL) {
+    await automationMaintenanceQueue.add(
+      'hourly',
+      {},
+      { jobId: 'automation-hourly-recurring', repeat: { every: 60 * 60 * 1000 } }
+    );
+    await automationMaintenanceQueue.add(
+      'daily-fullsync',
+      {},
+      { jobId: 'automation-daily-fullsync-recurring', repeat: { every: 24 * 60 * 60 * 1000 } }
+    );
+    logger.info(
+      'Automation maintenance repeatable jobs scheduled (hourly: 60 min, daily-fullsync: 24h)'
+    );
+  } else {
+    logger.warn('Automation maintenance queue not available (REDIS_URL?). Skipping scheduled jobs.');
+  }
+
   worker.on('completed', (job) => {
     logger.info({ jobId: job.id, name: job.name }, 'Job completed');
   });
@@ -390,8 +466,12 @@ const start = async () => {
     logger.error({ jobId: job?.id, error }, 'Job failed');
   });
 
-  pmsSyncWorker.on('completed', (job) => {
+  pmsSyncWorker.on('completed', async (job) => {
     logger.info({ jobId: job.id, name: job.name }, 'PMS sync job completed');
+    const { tenantId, connectionId } = job?.data || {};
+    if (tenantId && connectionId) {
+      await releaseLock(tenantId, connectionId);
+    }
   });
 
   pmsSyncWorker.on('failed', async (job, error) => {
@@ -406,16 +486,29 @@ const start = async () => {
       },
       'PMS sync job failed'
     );
+    const tenantId = job?.data?.tenantId;
+    if (tenantId && connectionId) {
+      await releaseLock(tenantId, connectionId);
+    }
     if (connectionId) {
       try {
-        await PmsConnection.update(
-          {
-            status: 'error',
-            lastError: { message: error?.message || 'Sync job failed' },
-          },
-          { where: { id: connectionId } }
-        );
-        logger.info({ connectionId }, 'PMS connection status reset to error after job failure');
+        const conn = await PmsConnection.findByPk(connectionId, { attributes: ['id', 'syncState'] });
+        if (conn) {
+          const prevState = conn.syncState ?? {};
+          await PmsConnection.update(
+            {
+              status: 'error',
+              lastError: { message: error?.message || 'Sync job failed' },
+              syncState: {
+                ...prevState,
+                lastRunStatus: 'FAILED',
+                lastErrorMessage: error?.message || 'Sync job failed',
+              },
+            },
+            { where: { id: connectionId } }
+          );
+          logger.info({ connectionId }, 'PMS connection status reset to error after job failure');
+        }
       } catch (updateErr) {
         logger.warn({ connectionId, err: updateErr?.message }, 'Could not reset connection status to error');
       }
@@ -429,6 +522,13 @@ const start = async () => {
   });
   collectionTickWorker.on('failed', (job, error) => {
     logger.error({ jobId: job?.id, error }, 'Collection tick job failed');
+  });
+
+  automationMaintenanceWorker.on('completed', (job) => {
+    logger.info({ jobId: job.id, name: job.name }, 'Automation maintenance job completed');
+  });
+  automationMaintenanceWorker.on('failed', (job, error) => {
+    logger.error({ jobId: job?.id, name: job?.name, error }, 'Automation maintenance job failed');
   });
 
   const doForceClose = async () => {
@@ -446,6 +546,11 @@ const start = async () => {
       await collectionTickWorker.close();
     } catch (e) {
       logger.warn({ err: e?.message }, 'Error closing collection tick worker');
+    }
+    try {
+      await automationMaintenanceWorker.close();
+    } catch (e) {
+      logger.warn({ err: e?.message }, 'Error closing automation maintenance worker');
     }
     try {
       await redisConnection.quit();
@@ -488,6 +593,7 @@ const start = async () => {
       await worker.close();
       await pmsSyncWorker.close();
       await collectionTickWorker.close();
+      await automationMaintenanceWorker.close();
       if (shutdownTimeoutId) {
         clearTimeout(shutdownTimeoutId);
         shutdownTimeoutId = null;

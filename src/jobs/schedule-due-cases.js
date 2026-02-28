@@ -59,6 +59,9 @@ export const listDueCallCases = async ({
       JOIN flow_policies fp ON fp.id = dc.flow_policy_id
       WHERE dc.status IN ('NEW','IN_PROGRESS')
         AND (dc.next_action_at IS NULL OR dc.next_action_at <= NOW())
+        AND COALESCE(dc.approval_status, 'APPROVED') = 'APPROVED'
+        AND COALESCE(dc.amount_due_cents, 0) > 0
+        AND NOT EXISTS (SELECT 1 FROM case_disputes cd WHERE cd.debt_case_id = dc.id AND cd.status = 'OPEN')
         ${tenantClause}
         ${demoClause}
         AND COALESCE((fp.channels->>'call')::boolean, false) = true
@@ -113,6 +116,9 @@ const claimDueCallCases = async ({
       JOIN flow_policies fp ON fp.id = dc.flow_policy_id
       WHERE dc.status IN ('NEW','IN_PROGRESS')
         AND (dc.next_action_at IS NULL OR dc.next_action_at <= NOW())
+        AND COALESCE(dc.approval_status, 'APPROVED') = 'APPROVED'
+        AND COALESCE(dc.amount_due_cents, 0) > 0
+        AND NOT EXISTS (SELECT 1 FROM case_disputes cd WHERE cd.debt_case_id = dc.id AND cd.status = 'OPEN')
         ${tenantClause}
         ${demoClause}
         AND COALESCE((fp.channels->>'call')::boolean, false) = true
