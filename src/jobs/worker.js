@@ -36,6 +36,42 @@ const concurrency = Number(process.env.WORKER_CONCURRENCY) || 5;
 const cooldownMinutes = Number(process.env.WORKER_COOLDOWN_MINUTES) || 360;
 const contextSignatureVersion = process.env.CALL_CONTEXT_SIGNATURE_VERSION || '1';
 const contextTtlSeconds = Number(process.env.CALL_CONTEXT_TTL_SECONDS) || 600;
+const quietHoursTimezone = process.env.WORKER_QUIET_HOURS_TIMEZONE || 'America/Bogota';
+
+const parseHour = (value, fallback) => {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  const i = Math.trunc(n);
+  if (i < 0 || i > 23) return fallback;
+  return i;
+};
+
+const quietHoursStart = parseHour(process.env.WORKER_QUIET_HOURS_START, 20); // 8:00 PM
+const quietHoursEnd = parseHour(process.env.WORKER_QUIET_HOURS_END, 7); // 7:00 AM
+
+const getHourInTimezone = (date, timeZone) => {
+  const formatted = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hour12: false,
+    hour: '2-digit',
+  }).format(date);
+  return Number(formatted);
+};
+
+const isInsideQuietHours = (date = new Date()) => {
+  const hour = getHourInTimezone(date, quietHoursTimezone);
+
+  // Same start/end means "always quiet".
+  if (quietHoursStart === quietHoursEnd) return true;
+
+  // Overnight window (e.g. 20 -> 7).
+  if (quietHoursStart > quietHoursEnd) {
+    return hour >= quietHoursStart || hour < quietHoursEnd;
+  }
+
+  // Same-day window.
+  return hour >= quietHoursStart && hour < quietHoursEnd;
+};
 
 const getTwilioConfig = () => {
   const accountSid = process.env.TWILIO_ACCOUNT_SID;
@@ -407,6 +443,18 @@ const start = async () => {
     COLLECTION_TICK_QUEUE_NAME,
     async (job) => {
       if (job.name === 'tick') {
+        if (isInsideQuietHours()) {
+          logger.info(
+            {
+              jobId: job.id,
+              timezone: quietHoursTimezone,
+              quietHoursStart,
+              quietHoursEnd,
+            },
+            'Skipping collection tick during quiet hours'
+          );
+          return { skipped: true, reason: 'quiet_hours' };
+        }
         logger.debug({ jobId: job.id }, 'Collection tick job started');
         return runCollectionTick();
       }
@@ -424,6 +472,18 @@ const start = async () => {
     AUTOMATION_MAINTENANCE_QUEUE_NAME,
     async (job) => {
       if (job.name === 'hourly') {
+        if (isInsideQuietHours()) {
+          logger.info(
+            {
+              jobId: job.id,
+              timezone: quietHoursTimezone,
+              quietHoursStart,
+              quietHoursEnd,
+            },
+            'Skipping automation hourly maintenance during quiet hours'
+          );
+          return { skipped: true, reason: 'quiet_hours' };
+        }
         logger.info({ jobId: job.id }, 'Automation hourly maintenance job started');
         return runHourlyMaintenance();
       }
