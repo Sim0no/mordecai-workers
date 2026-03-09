@@ -10,13 +10,14 @@
     "bullmq": "^5.66.6",
     "dotenv": "^17.2.3",
     "ioredis": "^5.9.2",
-    "mordcai-api": "git+https://github.com/Cristobal1002/mordecai-api.git#qa",
+    "mordcai-api": "file:../mordecai-api",
     "pg": "^8.16.3",
     "pg-hstore": "^2.3.4",
     "pino": "^9.6.0",
     "pino-pretty": "^13.0.0",
     "sequelize": "^6.37.7"
   },
+  "_comment_mordcai_api_git": "git+https://github.com/Cristobal1002/mordecai-api.git#qa",
   "engines": {
     "node": ">=18.0.0",
     "npm": ">=9.0.0"
