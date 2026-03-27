@@ -89,6 +89,23 @@ const getTwilioConfig = () => {
   return { accountSid, authToken, fromNumber, voiceUrl, contextHmacSecret };
 };
 
+/**
+ * POST target for Twilio call status (busy / no-answer / completed / failed).
+ * Prefer TWILIO_VOICE_STATUS_CALLBACK_URL; else derive .../twilio/voice/status from TWILIO_VOICE_URL.
+ */
+const buildVoiceStatusCallbackUrl = (voiceUrl) => {
+  const explicit = process.env.TWILIO_VOICE_STATUS_CALLBACK_URL?.trim();
+  if (explicit) return explicit;
+  try {
+    const u = new URL(voiceUrl);
+    const path = u.pathname.replace(/\/+$/, '');
+    u.pathname = path.endsWith('/voice/status') ? path : `${path}/status`;
+    return u.toString();
+  } catch {
+    return null;
+  }
+};
+
 const buildSignedVoiceUrl = ({ voiceUrl, interactionId, tenantId, caseId, contextHmacSecret }) => {
   const exp = Math.floor(Date.now() / 1000) + contextTtlSeconds;
   const payload = `${interactionId}|${tenantId}|${caseId}|${exp}|${contextSignatureVersion}`;
@@ -116,11 +133,23 @@ const createTwilioCall = async ({ to, interactionId, tenantId, caseId }) => {
     contextHmacSecret,
   });
 
+  const statusCallbackUrl = buildVoiceStatusCallbackUrl(voiceUrl);
   const params = new URLSearchParams({
     To: to,
     From: fromNumber,
     Url: signedVoiceUrl,
   });
+  if (statusCallbackUrl) {
+    params.set('StatusCallback', statusCallbackUrl);
+    params.set('StatusCallbackMethod', 'POST');
+    // Fires when the call ends; CallStatus will be completed | busy | no-answer | failed | canceled, etc.
+    params.set('StatusCallbackEvent', 'completed');
+  } else {
+    logger.warn(
+      { voiceUrl },
+      'Could not build Twilio StatusCallback URL; voice terminal states may not update interaction_logs'
+    );
+  }
 
   const response = await fetch(
     `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Calls.json`,
