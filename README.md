@@ -45,11 +45,16 @@ CREDENTIALS_ENCRYPTION_KEY=<mismo valor que en mordecai-api, ej. base64 32 bytes
 
 Puedes copiar el `.env` de la API o enlazarlo.
 
-**Desarrollo local con API en el mismo repo (monorepo):** para que el worker use el API local y no Git, en `package.json` pon `"mordcai-api": "file:../mordecai-api"` y luego `npm install`. Así no dependes del branch remoto.
+**Dependencia del código de la API (monorepo):** por defecto el `package.json` usa **`"mordcai-api": "file:../mordecai-api"`**. Es la misma carpeta del proyecto API en tu disco: **no se duplica** el código; `npm install` solo enlaza ese path en `node_modules`. Ajusta la ruta relativa si tu `mordecai-api` no está al mismo nivel que `mordecai-workers`.
+
+**Solo worker, sin clone local del API:** cambia la dependencia a  
+`git+https://github.com/Cristobal1002/mordecai-api.git#qa` y ejecuta `npm install` (descarga el paquete en `node_modules`, no crea otra carpeta de proyecto al lado).
+
+**Alternativa:** `cd mordecai-api && npm link` y `cd mordecai-workers && npm link mordcai-api`.
 
 ### 3. Levantar servicios
 
-**Terminal 1 – API**
+**Terminal 1 – API** (tu instancia local o la que uses; si solo pruebas worker contra QA, puede ser el API desplegado en QA con la misma Redis/DB que configures en `.env`)
 
 ```bash
 cd mordecai-api

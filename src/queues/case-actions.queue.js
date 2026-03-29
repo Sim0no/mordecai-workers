@@ -1,4 +1,5 @@
 import { Queue } from 'bullmq';
+import { withBullmqPrefix } from 'mordcai-api/src/queues/bullmq-queue-options.js';
 import { redisConnection } from './redis.js';
 
 export const CASE_ACTIONS_QUEUE = 'case-actions';
@@ -10,6 +11,7 @@ export const JOB_TYPES = {
   SYNC_CALL_SUMMARY: 'SYNC_CALL_SUMMARY',
 };
 
-export const caseActionsQueue = new Queue(CASE_ACTIONS_QUEUE, {
-  connection: redisConnection,
-});
+export const caseActionsQueue = new Queue(
+  CASE_ACTIONS_QUEUE,
+  withBullmqPrefix({ connection: redisConnection })
+);

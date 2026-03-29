@@ -5,7 +5,8 @@ import { Op } from 'sequelize';
 import { loadDatabase } from 'mordcai-api/src/loaders/sequelize.load.js';
 import { sequelize } from 'mordcai-api/src/config/database.js';
 import { logger } from 'mordcai-api/src/utils/logger.js';
-import { redisConnection } from '../queues/redis.js';
+import { redisConnection, describeWorkerRedisTarget } from '../queues/redis.js';
+import { getBullmqPrefix, withBullmqPrefix } from 'mordcai-api/src/queues/bullmq-queue-options.js';
 import { CASE_ACTIONS_QUEUE, JOB_TYPES } from '../queues/case-actions.queue.js';
 import { PMS_SYNC_QUEUE_NAME } from 'mordcai-api/src/queues/pms-sync.queue.js';
 import { COLLECTION_TICK_QUEUE_NAME } from 'mordcai-api/src/queues/collection-tick.queue.js';
@@ -29,7 +30,7 @@ import {
   CaseDispute,
 } from 'mordcai-api/src/models/index.js';
 import { resolvePolicyForCase } from 'mordcai-api/src/modules/collections/policy-resolver.service.js';
-import { sendCollectionSms } from 'mordcai-api/src/modules/twilio/sms/twilio.sms.service.js';
+import { runSmsCaseDispatch } from 'mordcai-api/src/modules/collections/sms-case-dispatch.runner.js';
 import { sendCollectionEmail } from 'mordcai-api/src/modules/email/ses/ses.email.service.js';
 
 const concurrency = Number(process.env.WORKER_CONCURRENCY) || 5;
@@ -335,33 +336,8 @@ const processCallCase = async ({ tenantId, caseId }) => {
   }
 };
 
-const processSmsCase = async ({ tenantId, caseId, automationId, stateId }) => {
-  const debtCase = await DebtCase.findOne({
-    where: { id: caseId, tenantId },
-    include: [{ model: Debtor, as: 'debtor' }],
-  });
-  if (!debtCase) throw new Error('Debt case not found');
-
-  let stage = null;
-  if (stateId) {
-    const state = await CaseAutomationState.findByPk(stateId, {
-      include: [{ model: CollectionStage, as: 'currentStage' }],
-    });
-    stage = state?.currentStage || null;
-  }
-
-  const tenant = await Tenant.findByPk(tenantId, { attributes: ['id', 'name'] });
-
-  return sendCollectionSms({
-    tenantId,
-    automationId,
-    state: { debtCaseId: caseId, debtorId: debtCase.debtorId },
-    debtCase,
-    debtor: debtCase.debtor,
-    stage,
-    tenant,
-  });
-};
+const processSmsCase = async ({ tenantId, caseId, automationId, stateId }) =>
+  runSmsCaseDispatch({ tenantId, caseId, automationId, stateId });
 
 const processEmailCase = async ({ tenantId, caseId, automationId, stateId }) => {
   const debtCase = await DebtCase.findOne({
@@ -403,14 +379,14 @@ const start = async () => {
   }
 
   // Reduce Redis usage for Upstash (limit 500k req)
-  const workerOpts = {
+  const workerOpts = withBullmqPrefix({
     connection: redisConnection,
     concurrency,
     stalledInterval: 120000, // 2 min (default 30s) — fewer stall checks = fewer Redis calls
     sharedConnection: true,
     blockingTimeout: 60000, // 60s — in idle, pop every min vs ~5s default → ~10–12x fewer BZPOPMIN/EVALSHA
-    drainDelay: 5000,       // graceful drain on shutdown
-  };
+    drainDelay: 5000, // graceful drain on shutdown
+  });
 
   const worker = new Worker(
     CASE_ACTIONS_QUEUE,
@@ -419,6 +395,15 @@ const start = async () => {
         return processCallCase(job.data);
       }
       if (job.name === JOB_TYPES.SMS_CASE) {
+        logger.info(
+          {
+            jobId: job.id,
+            name: job.name,
+            attempt: job.attemptsMade + 1,
+            ...job.data,
+          },
+          'SMS_CASE job picked up'
+        );
         return processSmsCase(job.data);
       }
       if (job.name === JOB_TYPES.EMAIL_CASE) {
@@ -429,6 +414,24 @@ const start = async () => {
     },
     { ...workerOpts }
   );
+
+  {
+    const redisDesc = describeWorkerRedisTarget();
+    const prefix = getBullmqPrefix();
+    logger.info(
+      {
+        queue: CASE_ACTIONS_QUEUE,
+        redisHost: redisDesc.host,
+        bullmqPrefix: prefix || 'bull (default)',
+      },
+      'Case-actions BullMQ worker listening'
+    );
+    if (!prefix) {
+      logger.warn(
+        'BULLMQ_PREFIX is unset: another worker on the same REDIS_URL may consume trigger-sms jobs. Set BULLMQ_PREFIX identically in API + mordecai-workers/.env for a private namespace, or set DISPATCH_SMS_INLINE=true on the API to send SMS without the queue.'
+      );
+    }
+  }
 
   const pmsSyncWorker = new Worker(
     PMS_SYNC_QUEUE_NAME,
@@ -493,7 +496,10 @@ const start = async () => {
     { ...workerOpts, concurrency: 1 }
   );
 
-  const collectionTickQueue = new Queue(COLLECTION_TICK_QUEUE_NAME, { connection: redisConnection });
+  const collectionTickQueue = new Queue(
+    COLLECTION_TICK_QUEUE_NAME,
+    withBullmqPrefix({ connection: redisConnection })
+  );
   await collectionTickQueue.add('tick', {}, { repeat: { every: 15 * 60 * 1000 } });
   logger.info('Collection tick repeatable job scheduled (every 15 min)');
 
@@ -526,9 +532,10 @@ const start = async () => {
     { ...workerOpts, concurrency: 1 }
   );
 
-  const automationMaintenanceQueue = new Queue(AUTOMATION_MAINTENANCE_QUEUE_NAME, {
-    connection: redisConnection,
-  });
+  const automationMaintenanceQueue = new Queue(
+    AUTOMATION_MAINTENANCE_QUEUE_NAME,
+    withBullmqPrefix({ connection: redisConnection })
+  );
   if (process.env.REDIS_URL) {
     await automationMaintenanceQueue.add(
       'hourly',
